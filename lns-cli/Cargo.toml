@@ -1,0 +1,21 @@
+[package]
+name = "lns-cli"
+description = "CLI for lns-ml inference, benchmarking, and perplexity evaluation"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "lns-cli"
+path = "src/main.rs"
+
+[dependencies]
+lns-core = { path = "../lns-core" }
+half = { workspace = true }
+bytemuck = { workspace = true }
+rkyv = { workspace = true }
+anyhow = { workspace = true }
+clap = { workspace = true }
+memmap2 = { workspace = true }

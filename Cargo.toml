@@ -1,0 +1,28 @@
+[workspace]
+members = [
+    "lns-core",
+    "lns-convert",
+    "lns-cli",
+    "lns-metal",
+    "lns-cuda",
+    "lns-rocm",
+    "lns-spirv",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+authors = ["muhammed burak şentürk"]
+repository = "https://github.com/meftunca/lns-ml"
+
+[workspace.dependencies]
+half = "2"
+bytemuck = { version = "1", features = ["derive"] }
+rkyv = { version = "0.7", features = ["validation"] }
+thiserror = "1"
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+safetensors = "0.4"
+memmap2 = "0.9"

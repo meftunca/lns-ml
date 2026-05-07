@@ -1,0 +1,22 @@
+[package]
+name = "lns-convert"
+description = "Converter from safetensors/GGUF to the lns-ml model format"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "lns-convert"
+path = "src/main.rs"
+
+[dependencies]
+lns-core = { path = "../lns-core" }
+half = { workspace = true }
+bytemuck = { workspace = true }
+rkyv = { workspace = true }
+anyhow = { workspace = true }
+clap = { workspace = true }
+safetensors = { workspace = true }
+memmap2 = { workspace = true }
