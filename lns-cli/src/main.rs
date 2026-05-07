@@ -8,18 +8,22 @@
 //!
 //! lns-cli bench --model model.lns [--tensor NAME] [--iters N]
 //!     Measure Q4_L decode throughput.
+//!
+//! lns-cli bench --model model.lns [--backend cpu|metal]
+//!     Select decode backend for benchmarking.
 //! ```
 
-use std::{fs, path::PathBuf, time::Instant};
+use std::{fs, path::PathBuf};
 
 use anyhow::{bail, Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use memmap2::MmapOptions;
 
 use lns_core::{
     format::{check_archived_model, QuantType},
     DEFAULT_SUPER_BLOCK_SIZE,
 };
+use lns_metal::{bench_q4l_decode, ComputeBackend};
 
 // ── CLI ───────────────────────────────────────────────────────────────────────
 
@@ -61,7 +65,17 @@ enum Command {
         /// Number of decode iterations.
         #[arg(short, long, default_value_t = 10)]
         iters: usize,
+
+        /// Decode backend to benchmark.
+        #[arg(long, value_enum, default_value_t = BenchBackend::Cpu)]
+        backend: BenchBackend,
     },
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum BenchBackend {
+    Cpu,
+    Metal,
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -153,7 +167,12 @@ fn cmd_inspect(model_path: &PathBuf, verbose: bool) -> Result<()> {
     Ok(())
 }
 
-fn cmd_bench(model_path: &PathBuf, tensor_filter: Option<&str>, iters: usize) -> Result<()> {
+fn cmd_bench(
+    model_path: &PathBuf,
+    tensor_filter: Option<&str>,
+    iters: usize,
+    backend: BenchBackend,
+) -> Result<()> {
     if iters == 0 {
         bail!("--iters must be > 0");
     }
@@ -192,29 +211,39 @@ fn cmd_bench(model_path: &PathBuf, tensor_filter: Option<&str>, iters: usize) ->
     let total_weights = total_blocks * DEFAULT_SUPER_BLOCK_SIZE;
 
     println!(
-        "Benchmarking {} Q4_L tensor(s)  ({} super-blocks, {} weights)  ×{} iters",
+        "Benchmarking {} Q4_L tensor(s)  ({} super-blocks, {} weights)  ×{} iters  [backend={:?}]",
         q4l_tensors.len(),
         total_blocks,
         total_weights,
         iters,
+        backend,
     );
 
-    let t_start = Instant::now();
-    let mut checksum = 0.0_f32; // prevent dead-code elimination
+    let compute_backend = match backend {
+        BenchBackend::Cpu => ComputeBackend::Cpu,
+        BenchBackend::Metal => ComputeBackend::Metal,
+    };
+    let mut elapsed = 0.0_f64;
+    let mut processed = 0usize;
+    let mut checksum = 0.0_f32;
 
-    for _ in 0..iters {
-        for t in &q4l_tensors {
-            let n_elements: usize = t.shape.iter().map(|&d| d as usize).product();
-            let blocks: &[lns_core::Q4LSuperBlock] = bytemuck::cast_slice(&t.data);
-            let decoded = lns_core::dequantize_q4l(blocks, n_elements);
-            // Accumulate into checksum to prevent the compiler from
-            // eliminating the decode entirely.
-            checksum += decoded.first().copied().unwrap_or(0.0);
-        }
+    for t in &q4l_tensors {
+        let n_elements: usize = t.shape.iter().map(|&d| d as usize).product();
+        let blocks: &[lns_core::Q4LSuperBlock] = bytemuck::cast_slice(&t.data);
+
+        let result = bench_q4l_decode(blocks, n_elements, iters, compute_backend)
+            .with_context(|| format!("benchmark failed for tensor '{}'", t.name.as_str()))?;
+
+        elapsed += result.elapsed_secs;
+        processed += result.weights_processed;
+        checksum += result.checksum;
     }
 
-    let elapsed = t_start.elapsed().as_secs_f64();
-    let weights_per_sec = (total_weights * iters) as f64 / elapsed;
+    let weights_per_sec = if elapsed > 0.0 {
+        processed as f64 / elapsed
+    } else {
+        0.0
+    };
 
     println!(
         "Elapsed: {elapsed:.3}s  |  {:.2} M weights/s  (checksum: {checksum:.6})",
@@ -235,6 +264,7 @@ fn main() -> Result<()> {
             model,
             tensor,
             iters,
-        } => cmd_bench(model, tensor.as_deref(), *iters),
+            backend,
+        } => cmd_bench(model, tensor.as_deref(), *iters, *backend),
     }
 }
