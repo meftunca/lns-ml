@@ -1,0 +1,11 @@
+[package]
+name = "lns-spirv"
+description = "Vulkan/OpenCL/WGSL via SPIR-V backend for lns-ml inference (Phase 3)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+lns-core = { path = "../lns-core" }
