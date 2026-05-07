@@ -6,11 +6,12 @@
 //! lns-cli inspect --model model.lns
 //!     Print model metadata and per-tensor statistics.
 //!
-//! lns-cli bench --model model.lns [--tensor NAME] [--iters N]
+//! lns-cli bench --model model.lns [--tensor NAME] [--iters N] [--backend cpu|metal]
 //!     Measure Q4_L decode throughput.
 //!
-//! lns-cli bench --model model.lns [--backend cpu|metal]
-//!     Select decode backend for benchmarking.
+//! lns-cli perplexity --model model.lns [--tensor NAME]
+//!     Codec-roundtrip quality benchmark: zero fraction, code entropy,
+//!     roundtrip RMSE, and SNR (dB) per tensor.
 //! ```
 
 use std::{fs, path::PathBuf};
@@ -23,7 +24,7 @@ use lns_core::{
     format::{check_archived_model, QuantType},
     DEFAULT_SUPER_BLOCK_SIZE,
 };
-use lns_metal::{bench_q4l_decode, ComputeBackend};
+use lns_metal::{bench_q4l_decode, decode_quality_report, ComputeBackend};
 
 // ── CLI ───────────────────────────────────────────────────────────────────────
 
@@ -69,6 +70,21 @@ enum Command {
         /// Decode backend to benchmark.
         #[arg(long, value_enum, default_value_t = BenchBackend::Cpu)]
         backend: BenchBackend,
+    },
+
+    /// Codec-roundtrip quality benchmark for Q4_L tensors.
+    ///
+    /// Decodes each Q4_L tensor, re-encodes the result, decodes again, and
+    /// reports per-tensor: zero fraction, 4-bit code entropy, roundtrip RMSE,
+    /// and SNR (dB).  Use this as the perplexity proxy for quantization quality.
+    Perplexity {
+        /// Path to the `.lns` model file.
+        #[arg(short, long)]
+        model: PathBuf,
+
+        /// Restrict analysis to tensors whose name contains this substring.
+        #[arg(short, long)]
+        tensor: Option<String>,
     },
 }
 
@@ -255,6 +271,96 @@ fn cmd_bench(
 
 // ── Entry point ───────────────────────────────────────────────────────────────
 
+fn cmd_perplexity(model_path: &PathBuf, tensor_filter: Option<&str>) -> Result<()> {
+    let file =
+        fs::File::open(model_path).with_context(|| format!("cannot open '{}'", model_path.display()))?;
+    let mmap = unsafe {
+        MmapOptions::new()
+            .map(&file)
+            .with_context(|| format!("cannot mmap '{}'", model_path.display()))?
+    };
+
+    let archived = check_archived_model(&mmap)
+        .with_context(|| format!("'{}' is not a valid .lns model", model_path.display()))?;
+
+    let q4l_tensors: Vec<_> = archived
+        .tensors
+        .iter()
+        .filter(|t| t.quant_type == QuantType::Q4L.as_u8())
+        .filter(|t| {
+            tensor_filter
+                .map(|f| t.name.as_str().contains(f))
+                .unwrap_or(true)
+        })
+        .collect();
+
+    if q4l_tensors.is_empty() {
+        bail!("no Q4_L tensors found matching the filter");
+    }
+
+    println!("Model:   {}", model_path.display());
+    println!("Q4_L tensors: {}", q4l_tensors.len());
+    println!();
+    println!(
+        "{:<60}  {:>10}  {:>8}  {:>8}  {:>10}  {:>8}",
+        "name", "weights", "zero%", "entropy", "rmse(m)", "snr(dB)"
+    );
+    println!("{}", "-".repeat(114));
+
+    let mut agg_weights = 0usize;
+    let mut agg_zero = 0.0_f64;
+    let mut agg_entropy = 0.0_f64;
+    let mut agg_snr = 0.0_f64;
+
+    for t in &q4l_tensors {
+        let n_elements: usize = t.shape.iter().map(|&d| d as usize).product();
+        let blocks: &[lns_core::Q4LSuperBlock] = bytemuck::cast_slice(&t.data);
+
+        let r = decode_quality_report(blocks, n_elements);
+
+        let snr_display = if r.roundtrip_snr_db.is_infinite() {
+            "    ∞".to_string()
+        } else {
+            format!("{:8.1}", r.roundtrip_snr_db)
+        };
+
+        println!(
+            "{:<60}  {:>10}  {:>7.2}%  {:>8.3}  {:>10.4}  {:>8}",
+            t.name.as_str(),
+            r.n_weights,
+            r.zero_fraction * 100.0,
+            r.code_entropy_bits,
+            r.roundtrip_rmse * 1e3,
+            snr_display.trim(),
+        );
+
+        agg_weights += r.n_weights;
+        agg_zero += r.zero_fraction * r.n_weights as f64;
+        agg_entropy += r.code_entropy_bits * r.n_weights as f64;
+        if r.roundtrip_snr_db.is_finite() {
+            agg_snr += r.roundtrip_snr_db * r.n_weights as f64;
+        }
+    }
+
+    if q4l_tensors.len() > 1 {
+        let n = agg_weights as f64;
+        println!("{}", "-".repeat(114));
+        println!(
+            "{:<60}  {:>10}  {:>7.2}%  {:>8.3}  {:>10}  {:>8.1}",
+            format!("AGGREGATE ({} tensors)", q4l_tensors.len()),
+            agg_weights,
+            agg_zero / n * 100.0,
+            agg_entropy / n,
+            "",
+            agg_snr / n,
+        );
+    }
+
+    Ok(())
+}
+
+// ── Entry point ───────────────────────────────────────────────────────────────
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
@@ -266,5 +372,6 @@ fn main() -> Result<()> {
             iters,
             backend,
         } => cmd_bench(model, tensor.as_deref(), *iters, *backend),
+        Command::Perplexity { model, tensor } => cmd_perplexity(model, tensor.as_deref()),
     }
 }
