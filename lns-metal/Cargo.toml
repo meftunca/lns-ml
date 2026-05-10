@@ -9,3 +9,11 @@ repository.workspace = true
 
 [dependencies]
 lns-core = { path = "../lns-core" }
+half = { workspace = true }
+metal = "0.27"
+objc = "0.2"
+block = "0.1"
+log = "0.4"
+lazy_static = "1.4"
+bytemuck = { workspace = true }
+clap = { workspace = true }

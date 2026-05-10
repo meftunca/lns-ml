@@ -1,0 +1,21 @@
+[package]
+name = "lns-inference"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+lns-core = { path = "../lns-core" }
+lns-metal = { path = "../lns-metal" }
+bytemuck = { workspace = true }
+half = { workspace = true }
+log = { workspace = true }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+anyhow = { workspace = true }
+rand = "0.8"
+rkyv = { workspace = true }
+metal = "0.27"
+tokenizers = "0.19"

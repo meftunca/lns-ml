@@ -12,3 +12,4 @@ half = { workspace = true }
 bytemuck = { workspace = true }
 rkyv = { workspace = true }
 thiserror = { workspace = true }
+rayon = { workspace = true }

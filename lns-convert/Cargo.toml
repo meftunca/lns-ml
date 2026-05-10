@@ -18,5 +18,11 @@ bytemuck = { workspace = true }
 rkyv = { workspace = true }
 anyhow = { workspace = true }
 clap = { workspace = true }
+rayon = { workspace = true }
 safetensors = { workspace = true }
 memmap2 = { workspace = true }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+[dev-dependencies]
+tempfile = "3"

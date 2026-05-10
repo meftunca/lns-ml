@@ -1,39 +1,30 @@
 //! lns-convert — convert safetensors models to the `.lns` format.
-//!
-//! # Usage
-//!
-//! ```text
-//! lns-convert --input  model.safetensors \
-//!             --output model.lns         \
-//!             --quant  Q4_L              \
-//!             --super-block 256
-//! ```
 
-use std::{
-    fmt,
-    fs,
-    path::PathBuf,
-    time::Instant,
-};
+mod input;
 
-use anyhow::{bail, Context, Result};
+use std::{fmt, fs, io::BufWriter, path::PathBuf, time::Instant};
+
+use anyhow::{bail, Result};
 use bytemuck::cast_slice;
 use clap::Parser;
 use half::f16;
-use memmap2::MmapOptions;
-use safetensors::{Dtype, SafeTensors};
+use safetensors::Dtype;
 
 use lns_core::{
-    format::{serialize_model, LnsModel, LnsTensor, QuantType, FORMAT_VERSION},
-    quantize_q4l, Q4LSuperBlock, DEFAULT_SUPER_BLOCK_SIZE,
+    format::{serialize_model_to_writer, LnsModel, LnsTensor, QuantType, FORMAT_VERSION},
+    DEFAULT_SUPER_BLOCK_SIZE,
 };
+
+use crate::input::{input_tensor_names, visit_input_tensors};
 
 // ── CLI ───────────────────────────────────────────────────────────────────────
 
-/// Supported quantisation formats.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum QuantFormat {
+    Q2L,
     Q4L,
+    Q4HQ,
+    Q8L,
     F16,
     F32,
 }
@@ -41,7 +32,10 @@ enum QuantFormat {
 impl fmt::Display for QuantFormat {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Q2L => write!(f, "Q2_L"),
             Self::Q4L => write!(f, "Q4_L"),
+            Self::Q4HQ => write!(f, "Q4_HQ"),
+            Self::Q8L => write!(f, "Q8_L"),
             Self::F16 => write!(f, "F16"),
             Self::F32 => write!(f, "F32"),
         }
@@ -52,98 +46,124 @@ impl std::str::FromStr for QuantFormat {
     type Err = anyhow::Error;
     fn from_str(s: &str) -> Result<Self> {
         match s.to_uppercase().as_str() {
+            "Q2_L" | "Q2L" => Ok(Self::Q2L),
             "Q4_L" | "Q4L" => Ok(Self::Q4L),
+            "Q4_HQ" | "Q4HQ" => Ok(Self::Q4HQ),
+            "Q8_L" | "Q8L" => Ok(Self::Q8L),
             "F16" => Ok(Self::F16),
             "F32" => Ok(Self::F32),
-            other => bail!("unknown quantisation format '{other}' (valid: Q4_L, F16, F32)"),
+            other => bail!(
+                "unknown quantisation format '{other}' (valid: Q2_L, Q4_L, Q4_HQ, Q8_L, F16, F32)"
+            ),
         }
     }
 }
 
-/// Convert a safetensors model to the lns-ml `.lns` format.
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
-    /// Input safetensors file.
     #[arg(short, long)]
     input: PathBuf,
 
-    /// Output `.lns` file.
     #[arg(short, long)]
     output: PathBuf,
 
-    /// Quantisation format for weight tensors (Q4_L, F16, F32).
     #[arg(short, long, default_value = "Q4_L")]
     quant: QuantFormat,
 
-    /// Super-block size for Q4_L (must be a multiple of 32; default 256).
-    /// Currently informational only — the super-block size is fixed at 256
-    /// in lns-core v0.1.
     #[arg(long, default_value_t = DEFAULT_SUPER_BLOCK_SIZE)]
     super_block: usize,
 
-    /// Minimum number of elements a tensor must have to be weight-quantised.
-    /// Tensors smaller than this threshold are stored as F32.
     #[arg(long, default_value_t = DEFAULT_SUPER_BLOCK_SIZE)]
     min_quant_elements: usize,
 
-    /// Suppress progress output.
     #[arg(long)]
     quiet: bool,
+
+    #[arg(
+        long,
+        help = "Skip known non-text branches such as Qwen vision/MTP tensors during conversion"
+    )]
+    text_only: bool,
+
+    /// Copy config.json, tokenizer.json and other metadata files from the input
+    /// directory into the same directory as the output .lns file, producing a
+    /// self-contained runnable bundle.
+    #[arg(long)]
+    bundle: bool,
+
+    /// Spec v3.3 sensitivity policy: when the base quant is Q4_L, promote the
+    /// PPL-sensitive output projections (`o_proj`, `down_proj`) to Q8_L.
+    /// Roughly +0.4 bits/weight average, ~30-50% PPL reduction. No effect for
+    /// non-Q4_L base quants.
+    #[arg(long)]
+    mixed_precision: bool,
 }
 
-// ── Conversion helpers ────────────────────────────────────────────────────────
+// ── Helpers ───────────────────────────────────────────────────────────────────
 
-/// Return `true` if a tensor should be quantised with the requested format
-/// rather than stored as F32.
-///
-/// Rules:
-/// - Tensor must be at least 2-D (weight matrices, embedding tables).
-/// - Tensor must contain more than `min_elements` values.
-/// - 1-D tensors (bias, layer-norm gamma/beta) are always F32.
-fn should_quantize(shape: &[usize], min_elements: usize) -> bool {
-    if shape.len() < 2 {
-        return false;
-    }
-    let n: usize = shape.iter().product();
-    n >= min_elements
-}
-
-/// Convert a raw byte slice from a safetensors tensor to a `Vec<f32>`.
-///
-/// Uses element-wise byte reads so the input slice need not be aligned.
 fn to_f32_vec(dtype: Dtype, raw: &[u8]) -> Result<Vec<f32>> {
-    Ok(match dtype {
-        Dtype::F32 => raw
-            .chunks_exact(4)
-            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-            .collect(),
-
-        Dtype::F16 => raw
-            .chunks_exact(2)
-            .map(|b| f16::from_le_bytes([b[0], b[1]]).to_f32())
-            .collect(),
-
+    match dtype {
+        Dtype::F32 => Ok(cast_slice::<u8, f32>(raw).to_vec()),
+        Dtype::F16 => {
+            let f16s = cast_slice::<u8, f16>(raw);
+            Ok(f16s.iter().map(|&v| v.to_f32()).collect())
+        }
         Dtype::BF16 => {
-            // BF16 = top 16 bits of an IEEE-754 f32.
-            raw.chunks_exact(2)
-                .map(|b| {
-                    let bits = u16::from_le_bytes([b[0], b[1]]);
-                    f32::from_bits((bits as u32) << 16)
-                })
-                .collect()
+            let bf16s = cast_slice::<u8, half::bf16>(raw);
+            Ok(bf16s.iter().map(|&v| v.to_f32()).collect())
         }
-
-        Dtype::I8 => {
-            // Dequantise int8 assuming symmetric scale = 1/127.
-            raw.iter().map(|&v| (v as i8) as f32 / 127.0).collect()
-        }
-
-        other => bail!("unsupported dtype {other:?}"),
-    })
+        _ => bail!("unsupported dtype {:?}", dtype),
+    }
 }
 
-/// Convert `f32` values to packed F16 bytes (u16 bit-patterns).
+fn should_quantize(shape: &[usize], min_elements: usize) -> bool {
+    let n: usize = shape.iter().product();
+    n >= min_elements && n % 32 == 0
+}
+
+fn keep_high_precision(name: &str) -> bool {
+    name.contains("embed_tokens")
+        || name.contains("lm_head")
+        || name.ends_with("norm.weight")
+        || name.ends_with("layernorm.weight")
+        || name.ends_with("linear_attn.conv1d.weight")
+        || name.ends_with("linear_attn.conv1d.bias")
+        || name.ends_with("linear_attn.A_log")
+        || name.ends_with("linear_attn.dt_bias")
+        || name.ends_with(".gate.weight") // MoE router — keep F16 for routing precision
+}
+
+fn skip_for_text_only_runtime(name: &str) -> bool {
+    name.starts_with("model.visual.") || name.starts_with("mtp.")
+}
+
+/// Spec v3.3 sensitivity policy. Returns `true` for output-projection tensors
+/// that are empirically 3-5× more sensitive to Q4 quantisation error than
+/// other linear weights, and so should be promoted to Q8_L when the
+/// `--mixed-precision` flag is on.
+///
+/// The classifier is purely name-based and matches the standard LLaMA /
+/// Qwen / Mistral naming conventions:
+///   * `o_proj`     — attention output projection
+///   * `down_proj`  — MLP down projection (post-SwiGLU)
+///   * `out_proj`   — alt name (some Qwen variants, linear-attn)
+fn is_sensitive_for_q8_promotion(name: &str) -> bool {
+    name.ends_with(".o_proj.weight")
+        || name.ends_with(".down_proj.weight")
+        || name.ends_with(".out_proj.weight")
+}
+
+fn is_embedding_weight(name: &str) -> bool {
+    name.ends_with("embed_tokens.weight") || name == "tok_embeddings.weight"
+}
+
+fn has_explicit_lm_head(names: &[String]) -> bool {
+    names
+        .iter()
+        .any(|name| name == "lm_head.weight" || name == "model.language_model.lm_head.weight")
+}
+
 fn f32_to_f16_bytes(values: &[f32]) -> Vec<u8> {
     let mut out = Vec::with_capacity(values.len() * 2);
     for &v in values {
@@ -152,145 +172,377 @@ fn f32_to_f16_bytes(values: &[f32]) -> Vec<u8> {
     out
 }
 
-// ── Main ──────────────────────────────────────────────────────────────────────
+fn raw_to_f16_bytes(dtype: Dtype, raw: Vec<u8>) -> Result<Vec<u8>> {
+    match dtype {
+        Dtype::F16 => Ok(raw),
+        Dtype::BF16 => {
+            let bf16s = cast_slice::<u8, half::bf16>(&raw);
+            let mut out = Vec::with_capacity(bf16s.len() * 2);
+            for &v in bf16s {
+                out.extend_from_slice(&f16::from_f32(v.to_f32()).to_bits().to_le_bytes());
+            }
+            Ok(out)
+        }
+        Dtype::F32 => {
+            let f32s = cast_slice::<u8, f32>(&raw);
+            let mut out = Vec::with_capacity(f32s.len() * 2);
+            for &v in f32s {
+                out.extend_from_slice(&f16::from_f32(v).to_bits().to_le_bytes());
+            }
+            Ok(out)
+        }
+        _ => bail!("unsupported dtype {:?}", dtype),
+    }
+}
+
+fn convert_tensor(
+    name: &str,
+    shape_usize: &[usize],
+    dtype: Dtype,
+    raw: Vec<u8>,
+    args: &Args,
+) -> Result<LnsTensor> {
+    let shape: Vec<u64> = shape_usize.iter().map(|&s| s as u64).collect();
+    let keep_fp = keep_high_precision(name);
+    let can_quantize = should_quantize(shape_usize, args.min_quant_elements);
+    let promote_to_q8 = args.mixed_precision
+        && args.quant == QuantFormat::Q4L
+        && !keep_fp
+        && is_sensitive_for_q8_promotion(name)
+        && can_quantize;
+
+    let (quant_type, data) = if keep_fp {
+        (QuantType::F16.as_u8(), raw_to_f16_bytes(dtype, raw)?)
+    } else {
+        let f32_values = to_f32_vec(dtype, &raw)?;
+        if promote_to_q8 {
+            (
+                QuantType::Q8L.as_u8(),
+                cast_slice::<lns_core::Q8LSuperBlock, u8>(&lns_core::quantize_q8l(&f32_values))
+                    .to_vec(),
+            )
+        } else if args.quant == QuantFormat::Q2L && can_quantize {
+            (
+                QuantType::Q2L.as_u8(),
+                cast_slice::<lns_core::Q2LSuperBlock, u8>(&lns_core::quantize_q2l(&f32_values))
+                    .to_vec(),
+            )
+        } else if args.quant == QuantFormat::Q4L && can_quantize {
+            (
+                QuantType::Q4L.as_u8(),
+                cast_slice::<lns_core::Q4LSuperBlock, u8>(&lns_core::quantize_q4l(&f32_values))
+                    .to_vec(),
+            )
+        } else if args.quant == QuantFormat::Q4HQ && can_quantize {
+            let blocks = lns_core::quantize_q4hq(&f32_values);
+            (
+                QuantType::Q4HQ.as_u8(),
+                lns_core::q4hq_blocks_to_payload(&blocks),
+            )
+        } else if args.quant == QuantFormat::Q8L && can_quantize {
+            (
+                QuantType::Q8L.as_u8(),
+                cast_slice::<lns_core::Q8LSuperBlock, u8>(&lns_core::quantize_q8l(&f32_values))
+                    .to_vec(),
+            )
+        } else if args.quant == QuantFormat::F16 && can_quantize {
+            (QuantType::F16.as_u8(), f32_to_f16_bytes(&f32_values))
+        } else {
+            (
+                QuantType::F32.as_u8(),
+                cast_slice::<f32, u8>(&f32_values).to_vec(),
+            )
+        }
+    };
+
+    Ok(LnsTensor {
+        name: name.to_string(),
+        quant_type,
+        shape,
+        data,
+    })
+}
+
+fn convert_tied_lm_head_duplicate(
+    shape_usize: &[usize],
+    dtype: Dtype,
+    raw: &[u8],
+    args: &Args,
+) -> Result<Option<LnsTensor>> {
+    if !should_quantize(shape_usize, args.min_quant_elements) {
+        return Ok(None);
+    }
+
+    let f32_values = to_f32_vec(dtype, raw)?;
+    let (quant_type, data) = match args.quant {
+        QuantFormat::Q4HQ => {
+            let blocks = lns_core::quantize_q4hq(&f32_values);
+            (
+                QuantType::Q4HQ.as_u8(),
+                lns_core::q4hq_blocks_to_payload(&blocks),
+            )
+        }
+        QuantFormat::Q4L | QuantFormat::Q8L | QuantFormat::Q2L => (
+            QuantType::Q4L.as_u8(),
+            cast_slice::<lns_core::Q4LSuperBlock, u8>(&lns_core::quantize_q4l(&f32_values))
+                .to_vec(),
+        ),
+        QuantFormat::F16 | QuantFormat::F32 => return Ok(None),
+    };
+
+    Ok(Some(LnsTensor {
+        name: "lm_head.weight".to_string(),
+        quant_type,
+        shape: shape_usize.iter().map(|&s| s as u64).collect(),
+        data,
+    }))
+}
+
+/// Files that must be present for the bundle to be usable.
+const BUNDLE_REQUIRED: &[&str] = &["config.json", "tokenizer.json"];
+
+/// Files that are copied when present but are not mandatory.
+const BUNDLE_OPTIONAL: &[&str] = &[
+    "tokenizer_config.json",
+    "special_tokens_map.json",
+    "vocab.json",
+    "merges.txt",
+    "chat_template.jinja",
+    "generation_config.json",
+];
+
+/// Copy metadata files from `src_dir` into `dest_dir` so the bundle is
+/// self-contained.  Returns an error only if a *required* file is missing or
+/// a copy fails; optional files are silently skipped when absent.
+fn copy_bundle_files(
+    src_dir: &std::path::Path,
+    dest_dir: &std::path::Path,
+    quiet: bool,
+) -> Result<()> {
+    for &name in BUNDLE_REQUIRED {
+        let src = src_dir.join(name);
+        if !src.exists() {
+            bail!(
+                "--bundle: required file '{}' not found in {:?}",
+                name,
+                src_dir
+            );
+        }
+        let dst = dest_dir.join(name);
+        fs::copy(&src, &dst)?;
+        if !quiet {
+            println!("  bundled: {name}");
+        }
+    }
+    for &name in BUNDLE_OPTIONAL {
+        let src = src_dir.join(name);
+        if src.exists() {
+            let dst = dest_dir.join(name);
+            fs::copy(&src, &dst)?;
+            if !quiet {
+                println!("  bundled: {name}");
+            }
+        }
+    }
+    Ok(())
+}
 
 fn main() -> Result<()> {
     let args = Args::parse();
-
-    // Validate super-block size.
-    if args.super_block % 32 != 0 || args.super_block < 64 || args.super_block > 512 {
-        bail!(
-            "--super-block must be a multiple of 32 in [64, 512], got {}",
-            args.super_block
-        );
-    }
-    if args.super_block != DEFAULT_SUPER_BLOCK_SIZE && !args.quiet {
-        eprintln!(
-            "warning: --super-block {} requested but lns-core v0.1 uses a fixed size of {}; \
-             the value is recorded in the archive but has no effect on encoding.",
-            args.super_block, DEFAULT_SUPER_BLOCK_SIZE
-        );
-    }
-
     let t0 = Instant::now();
 
-    // ── Open and mmap the safetensors file ───────────────────────────────────
+    // ── Phase 1: I/O + quantization — one tensor at a time ──────────────────
     if !args.quiet {
         println!("Reading {:?} …", args.input);
     }
-    let input_file = fs::File::open(&args.input)
-        .with_context(|| format!("cannot open input file '{}'", args.input.display()))?;
-    let mmap = unsafe {
-        MmapOptions::new()
-            .map(&input_file)
-            .with_context(|| format!("cannot mmap '{}'", args.input.display()))?
-    };
 
-    let safetensors = SafeTensors::deserialize(&mmap)
-        .with_context(|| format!("failed to parse safetensors file '{}'", args.input.display()))?;
-
-    // ── Convert tensors ──────────────────────────────────────────────────────
-    let mut lns_tensors: Vec<LnsTensor> = Vec::new();
+    let mut lns_tensors = Vec::new();
+    let mut skipped_count = 0usize;
+    let mut seen_count = 0usize;
+    let mut q2l_count = 0usize;
     let mut q4l_count = 0usize;
+    let mut q4hq_count = 0usize;
+    let mut q8l_count = 0usize;
     let mut f32_count = 0usize;
     let mut f16_count = 0usize;
-    let mut skipped = 0usize;
+    let tensor_names = input_tensor_names(&args.input)?;
+    let should_duplicate_tied_output = !has_explicit_lm_head(&tensor_names);
 
-    let tensor_list: Vec<_> = safetensors.tensors();
-
-    for (name, tensor_view) in &tensor_list {
-        let shape_usize: Vec<usize> = tensor_view.shape().to_vec();
-        let shape: Vec<u64> = shape_usize.iter().map(|&s| s as u64).collect();
-        let raw = tensor_view.data();
-        let dtype = tensor_view.dtype();
-
-        let f32_values = match to_f32_vec(dtype, raw) {
-            Ok(v) => v,
-            Err(e) => {
-                if !args.quiet {
-                    eprintln!("  skip {name}: {e}");
-                }
-                skipped += 1;
-                continue;
+    visit_input_tensors(
+        &args.input,
+        |name| {
+            let keep = !(args.text_only && skip_for_text_only_runtime(name));
+            if !keep {
+                skipped_count += 1;
             }
-        };
-
-        let (quant_type, data) =
-            if args.quant == QuantFormat::Q4L && should_quantize(&shape_usize, args.min_quant_elements) {
-                let blocks = quantize_q4l(&f32_values);
-                let bytes = cast_slice::<Q4LSuperBlock, u8>(&blocks).to_vec();
-                q4l_count += 1;
-                (QuantType::Q4L.as_u8(), bytes)
-            } else if args.quant == QuantFormat::F16 && should_quantize(&shape_usize, args.min_quant_elements) {
-                let bytes = f32_to_f16_bytes(&f32_values);
-                f16_count += 1;
-                (QuantType::F16.as_u8(), bytes)
+            keep
+        },
+        |name, dtype, shape, data| {
+            let tied_output_duplicate = if should_duplicate_tied_output && is_embedding_weight(name)
+            {
+                convert_tied_lm_head_duplicate(shape, dtype, &data, &args)?
             } else {
-                let bytes = cast_slice::<f32, u8>(&f32_values).to_vec();
-                f32_count += 1;
-                (QuantType::F32.as_u8(), bytes)
+                None
             };
+            let tensor = convert_tensor(name, shape, dtype, data, &args)?;
+            match tensor.quant_type {
+                x if x == QuantType::Q2L.as_u8() => q2l_count += 1,
+                x if x == QuantType::Q4L.as_u8() => q4l_count += 1,
+                x if x == QuantType::Q4HQ.as_u8() => q4hq_count += 1,
+                x if x == QuantType::Q8L.as_u8() => q8l_count += 1,
+                x if x == QuantType::F16.as_u8() => f16_count += 1,
+                _ => f32_count += 1,
+            }
+            lns_tensors.push(tensor);
+            seen_count += 1;
 
-        if !args.quiet {
-            let orig_bytes = raw.len();
-            let quant_bytes = data.len();
-            let ratio = orig_bytes as f64 / quant_bytes.max(1) as f64;
-            let qt_label = QuantType::from_u8(quant_type)
-                .map(|q| format!("{q:?}"))
-                .unwrap_or_else(|| format!("unknown({quant_type})"));
-            println!(
-                "  {name:60} {shape_usize:?} → {qt_label} \
-                 ({orig_bytes} → {quant_bytes} bytes, {ratio:.2}×)"
-            );
-        }
+            if let Some(tensor) = tied_output_duplicate {
+                match tensor.quant_type {
+                    x if x == QuantType::Q4L.as_u8() => q4l_count += 1,
+                    x if x == QuantType::Q4HQ.as_u8() => q4hq_count += 1,
+                    _ => f32_count += 1,
+                }
+                lns_tensors.push(tensor);
+                seen_count += 1;
+            }
 
-        lns_tensors.push(LnsTensor {
-            name: name.to_string(),
-            shape,
-            quant_type,
-            data,
-        });
+            if !args.quiet && seen_count % 10 == 0 {
+                eprintln!("  [{seen_count}] {name}");
+            }
+            Ok(())
+        },
+    )?;
+
+    if !args.quiet {
+        println!(
+            "Converted {seen_count} tensors in {:.2?} — serializing …",
+            t0.elapsed(),
+        );
     }
 
-    // ── Assemble and write model ─────────────────────────────────────────────
     let model = LnsModel {
         version: FORMAT_VERSION,
         tensors: lns_tensors,
     };
 
-    let total_orig: usize = tensor_list
-        .iter()
-        .map(|(_, tv)| tv.data().len())
-        .sum();
-    let total_quant = model.total_bytes();
+    if let Some(parent) = args.output.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let output = fs::File::create(&args.output)?;
+    serialize_model_to_writer(&model, BufWriter::new(output))?;
 
-    if !args.quiet {
-        println!(
-            "\nTensors: {} Q4_L  {} F16  {} F32  {} skipped",
-            q4l_count, f16_count, f32_count, skipped
-        );
-        println!(
-            "Size:    {:.2} MB → {:.2} MB  ({:.2}× compression)",
-            total_orig as f64 / 1e6,
-            total_quant as f64 / 1e6,
-            total_orig as f64 / total_quant.max(1) as f64,
-        );
+    if args.bundle {
+        // Resolve the input directory (handle file-path inputs too).
+        let src_dir = if args.input.is_dir() {
+            args.input.clone()
+        } else {
+            args.input
+                .parent()
+                .map(|p| p.to_path_buf())
+                .unwrap_or_else(|| PathBuf::from("."))
+        };
+        let dest_dir = args
+            .output
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| PathBuf::from("."));
+        if !args.quiet {
+            println!("Bundling metadata …");
+        }
+        copy_bundle_files(&src_dir, &dest_dir, args.quiet)?;
     }
 
-    let serialized =
-        serialize_model(&model).context("failed to serialise model")?;
-
-    fs::write(&args.output, &serialized)
-        .with_context(|| format!("cannot write output file '{}'", args.output.display()))?;
-
     if !args.quiet {
-        println!(
-            "Written {:?}  ({:.2} MB)  in {:.2}s",
-            args.output,
-            serialized.len() as f64 / 1e6,
-            t0.elapsed().as_secs_f64(),
-        );
+        println!("Conversion finished in {:?}", t0.elapsed());
+        println!("Summary:");
+        println!("  Q2_L: {}", q2l_count);
+        println!("  Q4_L: {}", q4l_count);
+        println!("  Q4_HQ: {}", q4hq_count);
+        println!("  Q8_L: {}", q8l_count);
+        println!("  F16:  {}", f16_count);
+        println!("  F32:  {}", f32_count);
+        println!("  Skipped: {}", skipped_count);
+        println!("Output saved to {:?}", args.output);
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{keep_high_precision, skip_for_text_only_runtime};
+
+    #[test]
+    fn keeps_qwen35_cpu_only_linear_attention_tensors_high_precision() {
+        assert!(keep_high_precision(
+            "model.language_model.layers.0.linear_attn.conv1d.weight"
+        ));
+        assert!(keep_high_precision(
+            "model.language_model.layers.0.linear_attn.A_log"
+        ));
+        assert!(keep_high_precision(
+            "model.language_model.layers.0.linear_attn.dt_bias"
+        ));
+        assert!(keep_high_precision(
+            "model.language_model.layers.0.linear_attn.norm.weight"
+        ));
+    }
+
+    #[test]
+    fn still_allows_quantizing_large_projection_weights() {
+        assert!(!keep_high_precision(
+            "model.language_model.layers.0.linear_attn.in_proj_qkv.weight"
+        ));
+        assert!(!keep_high_precision(
+            "model.language_model.layers.0.linear_attn.out_proj.weight"
+        ));
+    }
+
+    #[test]
+    fn text_only_mode_skips_qwen_non_text_branches() {
+        assert!(skip_for_text_only_runtime(
+            "model.visual.blocks.0.attn.qkv.weight"
+        ));
+        assert!(skip_for_text_only_runtime(
+            "mtp.layers.0.self_attn.q_proj.weight"
+        ));
+        assert!(!skip_for_text_only_runtime(
+            "model.language_model.layers.0.self_attn.q_proj.weight"
+        ));
+    }
+
+    #[test]
+    fn bundle_copies_required_and_optional_files() {
+        use super::copy_bundle_files;
+        use std::fs;
+
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+
+        // Write required files.
+        fs::write(src.path().join("config.json"), b"{}").unwrap();
+        fs::write(src.path().join("tokenizer.json"), b"{}").unwrap();
+        // Write one optional file.
+        fs::write(src.path().join("chat_template.jinja"), b"tmpl").unwrap();
+
+        copy_bundle_files(src.path(), dst.path(), true).unwrap();
+
+        assert!(dst.path().join("config.json").exists());
+        assert!(dst.path().join("tokenizer.json").exists());
+        assert!(dst.path().join("chat_template.jinja").exists());
+        // Non-existent optional file must NOT be created.
+        assert!(!dst.path().join("merges.txt").exists());
+    }
+
+    #[test]
+    fn bundle_errors_when_required_file_is_missing() {
+        use super::copy_bundle_files;
+
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        // Deliberately omit config.json / tokenizer.json.
+
+        let result = copy_bundle_files(src.path(), dst.path(), true);
+        assert!(result.is_err());
+    }
 }

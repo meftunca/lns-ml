@@ -6,7 +6,7 @@ members = [
     "lns-metal",
     "lns-cuda",
     "lns-rocm",
-    "lns-spirv",
+    "lns-spirv", "lns-inference",
 ]
 resolver = "2"
 
@@ -18,11 +18,13 @@ authors = ["muhammed burak şentürk"]
 repository = "https://github.com/meftunca/lns-ml"
 
 [workspace.dependencies]
-half = "2"
+half = { version = "2", features = ["bytemuck"] }
 bytemuck = { version = "1", features = ["derive"] }
-rkyv = { version = "0.7", features = ["validation"] }
+rkyv = { version = "0.7", default-features = false, features = ["std", "validation", "size_64"] }
 thiserror = "1"
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 safetensors = "0.4"
 memmap2 = "0.9"
+log = "0.4"
+rayon = "1"
